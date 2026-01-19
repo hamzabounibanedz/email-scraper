@@ -25,6 +25,13 @@ Thumbs.db
 *.swp
 *.swo
 
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
 # Docker
 docker-compose.override.yml
 
