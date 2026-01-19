@@ -1,0 +1,77 @@
+# University websites - one URL per line
+# Validated URLs only
+
+# Public Universities
+http://www.univ-tlemcen.dz
+https://www.univ-mosta.dz
+https://univ-bejaia.dz
+http://www.usthb.dz
+http://www.univ-alger.dz
+https://www.univ-eloued.dz
+http://www.univ-annaba.dz
+https://www.univ-biskra.dz
+https://www.univ-guelma.dz
+http://www.univ-batna.dz
+http://www.univ-batna2.dz
+http://www.univ-boumerdes.dz
+https://www.univ-tebessa.dz
+http://www.univ-chlef.dz
+https://www.univ-oran1.dz
+http://www.univ-oran.dz
+https://www.univ-constantine3.dz
+http://www.univ-jijel.dz
+http://www.univ-alger3.dz
+https://univ-laghouat.dz
+http://www.univ-oeb.dz
+http://www.univ-blida.dz
+https://univ-tiaret.dz
+http://www.univ-sba.dz
+https://www.univ-skikda.dz
+https://www.univ-saida.dz
+http://www.univ-souka.dz
+http://www.univ-setif2.dz
+https://www.univ-bouira.dz
+https://www.univ-djelfa.dz
+https://www.univ-medea.dz
+http://www.univ-alger2.dz
+https://www.univ-constantine2.dz
+http://www.univ-oran2.dz
+https://www.univ-bba.dz
+https://fr.univ-adrar.edu.dz
+https://www.univ-blida2.dz
+http://www.univ-mascara.dz
+https://www.univ-ghardaia.dz
+https://www.univ-emir-abdelkader.dz
+https://univ-km.dz
+https://univ-bechar.dz
+
+# Grandes Écoles (Sciences et techniques)
+http://www.enp.edu.dz
+https://www.enp-constantine.dz
+http://www.enp-oran.dz
+http://www.ensa.dz
+http://wp.ensbiotech.edu.dz
+http://www.ensjsi.dz
+http://www.ensmanagement.dz
+http://www.enssp.dz
+http://www.ensti-annaba.dz
+http://www.enssmal.edu.dz
+https://enstp.edu.dz
+https://www.ensh.dz
+http://www.esi.dz
+http://test.enssea.edu.dz
+http://www.ensv.dz
+
+# Écoles Normales Supérieures
+http://www.ens-kouba.dz
+http://www.ensb.dz
+
+# Écoles Supérieures Spécialisées
+http://hec.dz
+
+# Private Universities
+https://his.edu.dz
+https://ifag.edu.dz
+https://www.insimsup.dz
+https://www.esaa.dz
+https://www.isg.dz

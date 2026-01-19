@@ -1,0 +1,48 @@
+# Environment variables
+.env
+.env.local
+
+# n8n data
+data/
+!data/.gitkeep
+
+# Backups (optional - you may want to track these)
+backups/*.json
+backups/*.zip
+!backups/.gitkeep
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker
+docker-compose.override.yml
+
+# Sensitive files
+*.key
+*.pem
+*.p12
+service-account*.json
+credentials.json
+
+# Email lists (CSV files with email addresses)
+*.csv
+emails_clean.csv
+
+# Scraper outputs
+scraper/data/*.csv
+scraper/downloads/*
+scraper/logs/*
+!scraper/data/.gitkeep
+!scraper/downloads/.gitkeep
+!scraper/logs/.gitkeep
