@@ -28,13 +28,14 @@ LOGS_DIR.mkdir(exist_ok=True)
 # Scraper settings
 USER_AGENT = os.getenv("SCRAPER_USER_AGENT", "UniversityEmailScraper/1.0 (Contact: your-email@example.com)")
 REQUEST_DELAY_DEFAULT = float(os.getenv("SCRAPER_DELAY", "2.0"))  # seconds
-MAX_PAGES_PER_DOMAIN = int(os.getenv("SCRAPER_MAX_PAGES", "50"))
-TIMEOUT_SECONDS = int(os.getenv("SCRAPER_TIMEOUT", "15"))
-CONNECT_TIMEOUT_SECONDS = float(os.getenv("SCRAPER_CONNECT_TIMEOUT", "8"))
+MAX_PAGES_PER_DOMAIN = int(os.getenv("SCRAPER_MAX_PAGES", "2000"))  # Increased for large sites with many pages (e.g., 55 pages of teachers)
+TIMEOUT_SECONDS = int(os.getenv("SCRAPER_TIMEOUT", "30"))  # Increased for slow .dz sites
+CONNECT_TIMEOUT_SECONDS = float(os.getenv("SCRAPER_CONNECT_TIMEOUT", "10"))  # Reduced for faster failure on unreachable sites
 READ_TIMEOUT_SECONDS = float(os.getenv("SCRAPER_READ_TIMEOUT", str(TIMEOUT_SECONDS)))
-ROBOTS_TIMEOUT_SECONDS = float(os.getenv("SCRAPER_ROBOTS_TIMEOUT", "6"))
+ROBOTS_TIMEOUT_SECONDS = float(os.getenv("SCRAPER_ROBOTS_TIMEOUT", "3"))  # Reduced for faster failure
 RETRY_ATTEMPTS = int(os.getenv("SCRAPER_RETRIES", "3"))
 RETRY_BACKOFF_BASE = float(os.getenv("SCRAPER_BACKOFF", "1.0"))
+MAX_WORKERS = int(os.getenv("SCRAPER_MAX_WORKERS", "10"))  # Concurrent requests (increased for faster scraping)
 
 # User-Agent rotation for better stealth
 USER_AGENTS = [
@@ -54,7 +55,7 @@ OUTPUT_CLEAN = DATA_DIR / "emails_clean.csv"
 # Email filtering
 ALLOWED_EMAIL_DOMAIN = ".dz"  # Only .dz emails
 
-# Institutional email patterns to exclude (support, contact, generic emails)
+# Institutional email patterns to exclude (support, contact, generic emails, administrative)
 EXCLUDED_EMAIL_PATTERNS = [
     'noreply', 'no-reply', 'donotreply',
     'contact', 'info', 'support', 'help',
@@ -76,9 +77,16 @@ EXCLUDED_EMAIL_PATTERNS = [
     'generic', 'default', 'example',
     'elearning', 'e-learning', 'elearn',
     'authentification', 'auth', 'authentication',
-    'vrp', 'vrex', 'vr-relex', 'vr-',  # Vice-rector emails
-    'cei', 'ceil', 'lsp', 'laa',  # Department/service codes
-    'xxx.xxx',  # Placeholder emails
+    # Administrative/Vice-rector emails
+    'vrp', 'vrex', 'vr-relex', 'vr-', 'vr.pedagogie', 'vr.relex', 'vr.equip', 'vr.recherche',
+    # Dean emails
+    'doyen', 'doyen.', 'doyen.ecg', 'doyen.dsp', 'doyen.sci', 'doyen.tec', 'doyen.seg', 'doyen.ssh', 'doyen.lla',
+    # Center/Institute abbreviations
+    'cei', 'ceil', 'ciav', 'cri', 'ufc', 'lsp', 'laa', 'aih',
+    # Placeholder emails
+    'xxx.xxx', 'xxx',
+    # University-wide emails
+    'univ-mcd', 'univ.',
 ]
 
 # Logging

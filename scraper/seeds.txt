@@ -1,47 +1,7 @@
-# University websites - one URL per line
-# Only universities that don't have emails yet
-# Removed: univ-tlemcen, univ-mosta, univ-alger, univ-guelma, univ-boumerdes, 
-#          univ-constantine3, univ-eloued, univ-batna2, univ-oran2, univ-bba,
-#          univ-bejaia, univ-blida, univ-blida2, univ-bouira, univ-djelfa,
-#          univ-mascara, univ-saida, univ-sba, univ-setif2, univ-alger3,
-#          enp.edu.dz, ensa.dz, ensbiotech, ensh, ensjsi, ensm, ensmanagement,
-#          enssea, enssmal, enssp, enstp, ensv, esaa, hec
-
-# Public Universities (missing emails)
-http://www.usthb.dz
-http://www.univ-annaba.dz
-https://www.univ-biskra.dz
-http://www.univ-batna.dz
-https://www.univ-tebessa.dz
-http://www.univ-chlef.dz
-https://www.univ-oran1.dz
-http://www.univ-oran.dz
-http://www.univ-jijel.dz
-https://univ-laghouat.dz
-http://www.univ-oeb.dz
-https://univ-tiaret.dz
-https://www.univ-skikda.dz
-http://www.univ-souka.dz
-https://www.univ-medea.dz
-http://www.univ-alger2.dz
-https://www.univ-constantine2.dz
-https://fr.univ-adrar.edu.dz
-https://www.univ-ghardaia.dz
-https://www.univ-emir-abdelkader.dz
-https://univ-km.dz
-https://univ-bechar.dz
-
-# Grandes Écoles (Sciences et techniques) - missing emails
-https://www.enp-constantine.dz
-http://www.enp-oran.dz
-http://www.ensti-annaba.dz
-
-# Écoles Normales Supérieures - missing emails
-http://www.ensb.dz
-http://www.ens-kouba.dz
-
-# Private Universities - missing emails
-https://his.edu.dz
-https://ifag.edu.dz
-https://www.insimsup.dz
-https://www.isg.dz
+# Batna 2 University - staff websites page
+# Scraper will: 1) Find teacher name links from /websites pages
+#               2) Follow to teacher page (e.g., /yahiaoui-kais)
+#               3) Find "Contact" link on teacher page
+#               4) Follow to contact page (e.g., /yahiaoui-kais/contact)
+#               5) Extract email from contact page
+https://staff.univ-batna2.dz/websites

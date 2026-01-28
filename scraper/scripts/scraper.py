@@ -8,10 +8,15 @@ import random
 from collections import deque
 from pathlib import Path
 from datetime import datetime
-from typing import List, Set, Dict, Optional
+from typing import List, Set, Dict, Optional, Tuple
 from urllib.parse import urljoin, urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import urllib3
+from urllib3.exceptions import NameResolutionError as Urllib3NameResolutionError
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
@@ -41,15 +46,56 @@ logger = logging.getLogger(__name__)
 class EmailScraper:
     """Scraper for extracting .dz emails from university websites."""
     
-    def __init__(self):
+    def __init__(self, max_workers: int = None):
+        # Create session with connection pooling and retry strategy
         self.session = requests.Session()
-        self._rotate_user_agent()  # Set initial User-Agent
-        # Disable SSL verification for sites with expired/invalid certificates
-        # (Many Algerian university sites have certificate issues)
-        self.session.verify = False
+        self._rotate_user_agent()
+        self.session.verify = False  # Disable SSL verification for .dz sites
+        
+        # Configure retry strategy for robustness
+        # Set connect=0 to fail fast on DNS/connection errors (no retries)
+        # Only retry on HTTP status errors, not connection errors
+        retry_strategy = Retry(
+            total=RETRY_ATTEMPTS,
+            connect=0,  # No retries on connection/DNS errors - fail fast
+            read=RETRY_ATTEMPTS,  # Retry on read timeouts
+            backoff_factor=RETRY_BACKOFF_BASE,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["GET"]
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=10,
+            pool_maxsize=20
+        )
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+        
+        # Separate session for robots.txt with NO retries and shorter timeout
+        self.robots_session = requests.Session()
+        self.robots_session.verify = False
+        self.robots_session.headers.update({'User-Agent': self.session.headers.get('User-Agent', USER_AGENT)})
+        # No retry adapter for robots.txt - fail fast (max_retries=0)
+        no_retry_strategy = Retry(total=0)  # No retries at all
+        no_retry_adapter = HTTPAdapter(max_retries=no_retry_strategy, pool_connections=5, pool_maxsize=10)
+        self.robots_session.mount("http://", no_retry_adapter)
+        self.robots_session.mount("https://", no_retry_adapter)
+        
+        # Thread-safe data structures
         self.visited_urls: Set[str] = set()
+        self.visited_lock = Lock()
         self.robots_cache: Dict[str, Optional[urllib.robotparser.RobotFileParser]] = {}
+        self.robots_lock = Lock()
         self.email_pattern = re.compile(r'[\w.\-+%]+@[\w.\-]+\.dz\b', re.IGNORECASE)
+        self.max_workers = max_workers if max_workers is not None else MAX_WORKERS
+        
+        # HTML parser preference (lxml is faster, fallback to html.parser)
+        try:
+            import lxml
+            self.html_parser = 'lxml'
+        except ImportError:
+            self.html_parser = 'html.parser'
+            logger.warning("lxml not available, using html.parser (slower). Install with: pip install lxml")
     
     def _rotate_user_agent(self):
         """Rotate User-Agent header to avoid detection."""
@@ -73,44 +119,53 @@ class EmailScraper:
         return seeds
     
     def get_robots_parser(self, url: str) -> Optional[urllib.robotparser.RobotFileParser]:
-        """Get robots.txt parser for a domain (cached)."""
+        """Get robots.txt parser for a domain (cached, thread-safe, fast-fail)."""
         parsed = urlparse(url)
         original_host = parsed.netloc or ""
         if not original_host:
             return None
         
-        # Cache robots per host (normalized without www)
+        # Cache robots per base domain (normalized without www and subdomains)
+        # Use base domain so subdomains share the same robots.txt
         host = self._strip_www(original_host)
-        cache_key = host
+        # Extract base domain (e.g., 'univ-annaba.dz' from 'staff.univ-annaba.dz')
+        parts = host.split('.')
+        if len(parts) >= 2 and parts[-1] == 'dz':
+            base_domain = '.'.join(parts[-2:])  # Get last 2 parts
+        else:
+            base_domain = host
+        cache_key = base_domain
         
-        if cache_key in self.robots_cache:
-            return self.robots_cache[cache_key]
+        # Check cache first (thread-safe)
+        with self.robots_lock:
+            if cache_key in self.robots_cache:
+                return self.robots_cache[cache_key]
         
         rp = urllib.robotparser.RobotFileParser()
         
-        # Try both stripped and original host (some sites only have www. subdomain)
-        hosts_to_try = [host] if host == original_host else [host, original_host]
-        
-        for try_host in hosts_to_try:
-            for scheme in ['https', 'http']:
-                robots_url = f"{scheme}://{try_host}/robots.txt"
-                try:
-                    resp = self.session.get(
-                        robots_url,
-                        timeout=(CONNECT_TIMEOUT_SECONDS, ROBOTS_TIMEOUT_SECONDS),
-                        allow_redirects=True,
-                    )
-                    if resp.status_code == 200:
-                        rp.parse(resp.text.splitlines())
-                        logger.debug(f"Loaded robots.txt from {robots_url}")
-                        self.robots_cache[cache_key] = rp
-                        return rp
-                except Exception:
-                    continue  # Try next scheme/host
+        # Try base domain only (subdomains typically share same robots.txt)
+        # Use shorter timeout and no retries for robots.txt
+        # All .dz sites use HTTPS - only try HTTPS
+        robots_url = f"https://{base_domain}/robots.txt"
+        try:
+            resp = self.robots_session.get(
+                robots_url,
+                timeout=(2.0, 3.0),  # Very short timeout for robots.txt
+                allow_redirects=True,
+            )
+            if resp.status_code == 200:
+                rp.parse(resp.text.splitlines())
+                logger.debug(f"Loaded robots.txt from {robots_url}")
+                with self.robots_lock:
+                    self.robots_cache[cache_key] = rp
+                return rp
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, 
+                requests.exceptions.RequestException, Exception):
+            pass  # robots.txt not available
         
         # If all attempts failed, cache None to avoid retrying
-        logger.debug(f"Could not load robots.txt for {host} (tried {len(hosts_to_try)} host(s), 2 schemes)")
-        self.robots_cache[cache_key] = None
+        with self.robots_lock:
+            self.robots_cache[cache_key] = None
         return None
 
     def _strip_www(self, netloc: str) -> str:
@@ -118,14 +173,10 @@ class EmailScraper:
         return netloc[4:] if netloc.startswith("www.") else netloc
     
     def can_fetch(self, url: str) -> bool:
-        """Check if URL can be fetched according to robots.txt."""
-        rp = self.get_robots_parser(url)
-        if rp is None:
-            return True  # If robots.txt unavailable, proceed conservatively
-        
-        # Use current User-Agent from session (rotated) for robots.txt checking
-        current_ua = self.session.headers.get('User-Agent', USER_AGENT)
-        return rp.can_fetch(current_ua, url)
+        """Check if URL can be fetched according to robots.txt. Returns True to ignore robots.txt restrictions."""
+        # Ignore robots.txt - user wants to scrape everything that's accessible
+        # Many .dz sites have overly restrictive robots.txt that blocks legitimate content
+        return True
     
     def get_crawl_delay(self, url: str) -> float:
         """Get crawl delay from robots.txt or use default."""
@@ -139,7 +190,7 @@ class EmailScraper:
         return delay if delay else REQUEST_DELAY_DEFAULT
     
     def is_institutional_email(self, email: str) -> bool:
-        """Check if email is an institutional/support email (not a real person)."""
+        """Check if email is an institutional/support/administrative email (not a personal teacher email)."""
         # Safety check - email must have @
         if '@' not in email:
             return False  # Not an email, can't be institutional
@@ -149,14 +200,27 @@ class EmailScraper:
         except (ValueError, IndexError):
             return False  # Malformed email, skip
         
-        # Check against excluded patterns
+        # Check against excluded patterns (case-insensitive substring match)
         for pattern in EXCLUDED_EMAIL_PATTERNS:
-            if pattern in local_part:
+            pattern_lower = pattern.lower()
+            if pattern_lower in local_part:
                 return True
         
         # Exclude emails that are too short (likely generic)
         if len(local_part) < 3:
             return True
+        
+        # Exclude emails starting with admin prefixes (vr., doyen., chef., etc.)
+        admin_prefixes = ['vr.', 'doyen.', 'chef.', 'directeur.', 'director.', 'admin.', 'service.']
+        for prefix in admin_prefixes:
+            if local_part.startswith(prefix):
+                return True
+        
+        # Exclude short abbreviations (2-4 chars) that are likely admin codes
+        if len(local_part) <= 4 and '.' not in local_part and '-' not in local_part:
+            # If it's all uppercase or very short, likely an abbreviation
+            if local_part.isupper() or len(local_part) <= 3:
+                return True
         
         return False
     
@@ -201,97 +265,187 @@ class EmailScraper:
         return emails
     
     def fetch_html(self, url: str, retries: int = RETRY_ATTEMPTS) -> Optional[requests.Response]:
-        """Fetch HTML page with retries."""
-        # Try both http/https when one is clearly failing (very common on .dz sites)
-        def alt_scheme(u: str) -> Optional[str]:
+        """Fetch HTML page with retries and robust .dz domain handling."""
+        # All .dz sites use HTTPS - no need to try HTTP
+        # Ensure URL uses HTTPS
+        def ensure_https(u: str) -> str:
             try:
                 parsed = urlparse(u)
                 if not parsed.netloc:
-                    return None
-                if parsed.scheme == "http":
+                    return u
+                # If no scheme or http, use https
+                if not parsed.scheme or parsed.scheme == "http":
                     new_scheme = "https"
-                elif parsed.scheme == "https":
-                    new_scheme = "http"
-                else:
-                    return None
-                # Reconstruct URL preserving all components
-                new_url = f"{new_scheme}://{parsed.netloc}"
-                if parsed.path:
-                    new_url += parsed.path
-                elif not parsed.path and parsed.query:
-                    new_url += "/"
-                if parsed.query:
-                    new_url += f"?{parsed.query}"
-                if parsed.fragment:
-                    new_url += f"#{parsed.fragment}"
-                return new_url
+                    new_url = f"{new_scheme}://{parsed.netloc}"
+                    if parsed.path:
+                        new_url += parsed.path
+                    elif not parsed.path and parsed.query:
+                        new_url += "/"
+                    if parsed.query:
+                        new_url += f"?{parsed.query}"
+                    if parsed.fragment:
+                        new_url += f"#{parsed.fragment}"
+                    return new_url
+                return u
             except Exception:
-                return None
+                return u
 
-        for attempt in range(retries):
+        # Try www and non-www variants for .dz domains
+        def try_www_variants(u: str) -> List[str]:
+            variants = [u]
             try:
-                # Rotate User-Agent periodically to avoid detection
-                if attempt == 0 or random.random() < 0.3:  # 30% chance to rotate on retries
-                    self._rotate_user_agent()
+                parsed = urlparse(u)
+                if not parsed.netloc:
+                    return variants
+                netloc = parsed.netloc
+                scheme = parsed.scheme or 'https'
                 
-                response = self.session.get(
-                    url,
-                    timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS),
-                    allow_redirects=True,
-                )
-                response.raise_for_status()
-                return response
-            except requests.exceptions.HTTPError as e:
-                # Don't retry 404 (Not Found) or 403 (Forbidden) - these are permanent
-                if e.response.status_code in [404, 403]:
-                    logger.debug(f"Skipping {url} - {e.response.status_code} {e.response.reason}")
-                    return None
-                # Retry other HTTP errors (500, 502, 503, etc.)
-                if attempt < retries - 1:
-                    wait_time = RETRY_BACKOFF_BASE * (2 ** attempt)
-                    logger.warning(f"Retry {attempt + 1}/{retries} for {url} after {wait_time}s: {e.response.status_code} {e.response.reason}")
-                    time.sleep(wait_time)
+                if netloc.startswith('www.'):
+                    # Try without www
+                    new_netloc = netloc[4:]
+                    new_url = f"{scheme}://{new_netloc}{parsed.path or '/'}"
+                    if parsed.query:
+                        new_url += f"?{parsed.query}"
+                    if parsed.fragment:
+                        new_url += f"#{parsed.fragment}"
+                    variants.append(new_url)
                 else:
-                    logger.error(f"Failed to fetch {url} after {retries} attempts: {e.response.status_code} {e.response.reason}")
-                    return None
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-                # Retry timeouts and connection errors
-                # If we are on the last attempt, try switching scheme once before giving up
-                if attempt == retries - 1:
-                    alt = alt_scheme(url)
-                    if alt and alt != url:
-                        try:
-                            logger.info(f"Retrying with alternate scheme: {alt}")
-                            response = self.session.get(
-                                alt,
-                                timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS),
-                                allow_redirects=True,
-                            )
-                            response.raise_for_status()
-                            return response
-                        except Exception:
-                            pass
-                if attempt < retries - 1:
-                    wait_time = RETRY_BACKOFF_BASE * (2 ** attempt)
-                    logger.warning(f"Retry {attempt + 1}/{retries} for {url} after {wait_time}s: {e}")
-                    time.sleep(wait_time)
-                else:
-                    logger.error(f"Failed to fetch {url} after {retries} attempts: {e}")
-                    return None
-            except requests.exceptions.RequestException as e:
-                # Other request exceptions
-                if attempt < retries - 1:
-                    wait_time = RETRY_BACKOFF_BASE * (2 ** attempt)
-                    logger.warning(f"Retry {attempt + 1}/{retries} for {url} after {wait_time}s: {e}")
-                    time.sleep(wait_time)
-                else:
-                    logger.error(f"Failed to fetch {url} after {retries} attempts: {e}")
-                    return None
+                    # Try with www
+                    new_netloc = f"www.{netloc}"
+                    new_url = f"{scheme}://{new_netloc}{parsed.path or '/'}"
+                    if parsed.query:
+                        new_url += f"?{parsed.query}"
+                    if parsed.fragment:
+                        new_url += f"#{parsed.fragment}"
+                    variants.append(new_url)
+            except Exception:
+                pass
+            return variants
+
+        # Ensure HTTPS and try all URL variants - prioritize trying different URLs over retrying same URL
+        url = ensure_https(url)
+        url_variants = try_www_variants(url)
+        
+        # For timeout/connection errors, reduce retries to 1 (fail fast)
+        # For other errors, use normal retries
+        timeout_retries = 1  # Fast fail on timeouts
+        normal_retries = retries
+        
+        for url_to_try in url_variants:
+            # Determine retry count based on error type (will be set in exception handler)
+            current_retries = normal_retries
+            
+            for attempt in range(current_retries):
+                try:
+                    # Rotate User-Agent periodically
+                    if attempt == 0 or random.random() < 0.3:
+                        self._rotate_user_agent()
+                    
+                    # Add realistic browser headers to avoid detection
+                    headers = {
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.9',
+                        'Accept-Encoding': 'gzip, deflate, br',
+                        'DNT': '1',
+                        'Connection': 'keep-alive',
+                        'Upgrade-Insecure-Requests': '1',
+                        'Sec-Fetch-Dest': 'document',
+                        'Sec-Fetch-Mode': 'navigate',
+                        'Sec-Fetch-Site': 'none',
+                        'Cache-Control': 'max-age=0',
+                        'Referer': 'https://www.google.com/',  # Fake referer
+                    }
+                    self.session.headers.update(headers)
+                    
+                    # Add random delay before request (human-like)
+                    if attempt > 0:
+                        time.sleep(random.uniform(2, 5))
+                    
+                    response = self.session.get(
+                        url_to_try,
+                        timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS),
+                        allow_redirects=True,
+                    )
+                    response.raise_for_status()
+                    return response
+                except requests.exceptions.HTTPError as e:
+                    # Don't retry 404 or 403
+                    if e.response.status_code in [404, 403]:
+                        if url_to_try == url_variants[-1]:  # Last variant
+                            logger.warning(f"HTTP {e.response.status_code} for {url} - {e.response.reason}")
+                            # For 403 on /websites, still try Playwright (might work)
+                            if e.response.status_code == 403 and 'websites' in url.lower():
+                                logger.info(f"Got 403 for {url}, will try Playwright as fallback")
+                            return None
+                        break  # Try next variant
+                    # Retry other HTTP errors (but not too many times)
+                    if attempt < current_retries - 1:
+                        wait_time = RETRY_BACKOFF_BASE * (2 ** attempt)
+                        time.sleep(min(wait_time, 2.0))  # Cap wait time at 2 seconds
+                    elif url_to_try == url_variants[-1]:  # Last variant and last attempt
+                        logger.debug(f"Failed to fetch {url} after {current_retries} attempts: {e.response.status_code}")
+                        return None
+                except (Urllib3NameResolutionError, requests.exceptions.ConnectionError) as e:
+                    # DNS failures (NameResolutionError): fail immediately, no retries
+                    # Check if this is a DNS resolution error (domain doesn't exist)
+                    error_str = str(e).lower()
+                    is_dns_error = (
+                        isinstance(e, Urllib3NameResolutionError) or
+                        'getaddrinfo failed' in error_str or
+                        'name resolution' in error_str or
+                        'failed to resolve' in error_str
+                    )
+                    
+                    if is_dns_error:
+                        # DNS failure - domain doesn't exist, fail immediately (no retries)
+                        logger.debug(f"DNS resolution failed for {url_to_try} - domain does not exist")
+                        if url_to_try == url_variants[-1]:
+                            return None
+                        break  # Try next variant, but likely will also fail
+                    else:
+                        # Other connection errors (network issues) - no HTTP fallback, just try next variant
+                        # If this is the first attempt and we have more variants, try next variant
+                        if attempt == 0 and url_to_try != url_variants[-1]:
+                            break  # Try next variant
+                        # Otherwise fail
+                        if url_to_try == url_variants[-1]:
+                            logger.debug(f"Connection error for {url} - skipping")
+                            return None
+                except requests.exceptions.Timeout as e:
+                    # Timeouts: fail fast, try next variant immediately (no HTTP fallback)
+                    # If this is the first attempt and we have more variants, try next variant immediately
+                    if attempt == 0 and url_to_try != url_variants[-1]:
+                        break  # Try next variant immediately
+                    
+                    # If this is last variant, fail fast (no more retries for timeouts)
+                    if url_to_try == url_variants[-1]:
+                        logger.debug(f"Timeout for {url} - skipping after {attempt + 1} attempt(s)")
+                        return None
+                except requests.exceptions.SSLError:
+                    # SSL errors: skip this variant, try next (no HTTP fallback - all sites use HTTPS)
+                    # Try next variant
+                    if url_to_try == url_variants[-1]:
+                        logger.debug(f"SSL error for {url} - skipping")
+                        return None
+                    break  # Try next variant
+                except requests.exceptions.RequestException as e:
+                    # Other request exceptions: retry a few times
+                    if attempt < current_retries - 1:
+                        wait_time = RETRY_BACKOFF_BASE * (2 ** attempt)
+                        time.sleep(min(wait_time, 2.0))  # Cap wait time at 2 seconds
+                    elif url_to_try == url_variants[-1]:
+                        logger.debug(f"Failed to fetch {url} after {current_retries} attempts: {e}")
+                        return None
+        
         return None
     
     def extract_emails_from_html(self, html: str, url: str) -> List[Dict]:
         """Extract emails from HTML page - checks multiple sources."""
-        soup = BeautifulSoup(html, 'html.parser')
+        try:
+            soup = BeautifulSoup(html, self.html_parser)
+        except Exception:
+            # Fallback to html.parser if lxml fails
+            soup = BeautifulSoup(html, 'html.parser')
         page_title = soup.title.string if soup.title else ""
         
         all_emails = []
@@ -374,6 +528,13 @@ class EmailScraper:
         text_emails = self.extract_emails_from_text(text, url, 'html', page_title)
         all_emails.extend(text_emails)
         
+        # Debug: Log email extraction results
+        if text_emails:
+            logger.info(f"Found {len(text_emails)} emails in text content for {url}")
+        elif '@' in text and '.dz' in text:
+            # If we see @ and .dz but no emails found, might be filtered or wrong format
+            logger.debug(f"Found @ and .dz in text but no emails extracted from {url} (might be filtered)")
+        
         # 5. Extract from script tags (JSON-LD, JavaScript variables, etc.)
         for script in soup.find_all('script'):
             if script.string:
@@ -417,8 +578,35 @@ class EmailScraper:
                 try:
                     page = browser.new_page()
                     # Playwright timeout is in milliseconds
-                    page.goto(url, wait_until='networkidle', timeout=int(TIMEOUT_SECONDS * 1000))
+                    # Use 'domcontentloaded' first, then wait a bit for JS to render
+                    page.goto(url, wait_until='domcontentloaded', timeout=int(TIMEOUT_SECONDS * 1000))
+                    # Wait a bit for JavaScript to render content (especially for /websites pages)
+                    page.wait_for_timeout(3000)  # Wait 3 seconds for JS to render
+                    # Try to wait for content to load (if there are specific selectors)
+                    try:
+                        # Wait for table or main content to appear
+                        page.wait_for_selector('table, main, .content', timeout=5000)
+                    except:
+                        pass  # Continue even if selector doesn't appear
                     html = page.content()
+                    # Also get the rendered text to check for emails
+                    text_content = page.inner_text('body')
+                    page_title = page.title()
+                    
+                    # Debug: Check if page loaded correctly
+                    if '403' in page_title or 'forbidden' in page_title.lower() or 'access denied' in text_content.lower():
+                        logger.warning(f"Playwright got 403/forbidden page for {url}")
+                    else:
+                        logger.info(f"Playwright loaded page successfully: {page_title[:50]}")
+                    
+                    # Debug: Check for email-like content
+                    email_count = text_content.count('@')
+                    dz_count = text_content.count('.dz')
+                    if email_count > 0 and dz_count > 0:
+                        logger.info(f"Found {email_count} '@' symbols and {dz_count} '.dz' in page text for {url}")
+                    elif email_count > 0:
+                        logger.debug(f"Found {email_count} '@' symbols but no '.dz' in page text for {url}")
+                    
                     return html
                 finally:
                     # Ensure browser is closed even on exception
@@ -487,7 +675,10 @@ class EmailScraper:
     
     def find_links_on_page(self, html: str, base_url: str) -> List[str]:
         """Find all links on a page (for crawling), including subdomains."""
-        soup = BeautifulSoup(html, 'html.parser')
+        try:
+            soup = BeautifulSoup(html, self.html_parser)
+        except Exception:
+            soup = BeautifulSoup(html, 'html.parser')
         
         # Keywords that suggest pages with staff/contact information
         priority_keywords = ['staff', 'websites', 'contact', 'personnel', 'enseignants', 
@@ -495,10 +686,49 @@ class EmailScraper:
                              'faculte', 'faculty', 'departement', 'department', 'corps',
                              'enseignant', 'professeur', 'chercheur', 'researcher']
         
+        # Keywords for faculties/majors/departments (critical for finding teacher emails)
+        faculty_keywords = [
+            'faculte', 'faculty', 'facultes', 'faculties',
+            'departement', 'department', 'departements', 'departments',
+            'filiere', 'filiere', 'specialite', 'speciality',
+            'formation', 'formation', 'domaine', 'domain',
+            'section', 'section', 'option', 'option',
+            'mathematiques', 'mathematics', 'math', 'fmath',
+            'informatique', 'computer', 'info', 'cs',
+            'physique', 'physics', 'phys',
+            'chimie', 'chemistry', 'chim',
+            'biologie', 'biology', 'bio',
+            'electronique', 'electronics', 'elec',
+            'mecanique', 'mechanical', 'meca',
+            'genie', 'engineering', 'civil', 'archi',
+            'economie', 'economics', 'eco',
+            'droit', 'law', 'juridique',
+            'lettres', 'literature', 'langues',
+            'philosophie', 'philosophy', 'philo',
+            'sociologie', 'sociology', 'socio',
+            'psychologie', 'psychology', 'psy',
+            'medecine', 'medicine', 'med',
+            'pharmacie', 'pharmacy', 'pharma',
+            'sciences', 'sciences', 'sci',
+            'islamiques', 'islamic', 'fsi'
+        ]
+        
         priority_links = []
         regular_links = []
         subdomain_links = []  # Subdomain links get highest priority
+        faculty_links = []  # Faculty/major links get highest priority (even above subdomains)
+        teacher_links = []  # Teacher name links (e.g., /yahiaoui-kais) - HIGHEST PRIORITY
+        contact_links = []  # Contact links (especially on teacher pages) - HIGHEST PRIORITY
         seen_urls = set()  # Track normalized URLs to avoid duplicates
+        
+        # Check if current page is a teacher page (URL pattern like /firstname-lastname or /lastname-firstname)
+        base_parsed = urlparse(base_url)
+        path_parts = [p for p in base_parsed.path.split('/') if p]
+        is_teacher_page = (
+            len(path_parts) >= 1 and 
+            '-' in path_parts[-1] and  # Has hyphen (firstname-lastname pattern)
+            not any(kw in base_parsed.path.lower() for kw in ['websites', 'contact', 'page', 'admin'])
+        )
         
         # Also check for links in text content (some sites embed URLs in text)
         text_content = soup.get_text()
@@ -514,6 +744,11 @@ class EmailScraper:
             if parsed_link.scheme not in ['http', 'https', '']:
                 continue
             
+            # Skip login/admin pages early (they cause Playwright timeouts and have no emails)
+            href_lower = href.lower()
+            if any(skip in href_lower for skip in ['/user?', '/login', '/admin', 'admin_panel', '?login=', '&login=']):
+                continue
+            
             # Normalize URL
             normalized_url = self.normalize_url(full_url)
             
@@ -524,34 +759,91 @@ class EmailScraper:
             
             # Check if it's the same base domain (including subdomains)
             if self.is_same_base_domain(base_url, normalized_url):
-                if normalized_url not in self.visited_urls and self.can_fetch(normalized_url):
-                    # Check if this is a subdomain link (higher priority)
-                    base_parsed = urlparse(base_url)
-                    link_parsed = urlparse(normalized_url)
-                    is_subdomain = (link_parsed.netloc != base_parsed.netloc and 
-                                   self.is_same_base_domain(base_url, normalized_url))
-                    
-                    # Check if link text or URL contains priority keywords
-                    link_text = link.get_text(strip=True).lower()
-                    url_lower = normalized_url.lower()
-                    is_priority = any(keyword in link_text or keyword in url_lower 
-                                    for keyword in priority_keywords)
-                    
-                    if is_subdomain:
-                        subdomain_links.append(normalized_url)
-                    elif is_priority:
-                        priority_links.append(normalized_url)
-                    else:
-                        regular_links.append(normalized_url)
+                # Skip robots.txt check in find_links - it's done later when actually crawling
+                # This avoids hundreds of robots.txt requests for non-existent subdomains
+                # Check if this is a subdomain link (higher priority)
+                base_parsed = urlparse(base_url)
+                link_parsed = urlparse(normalized_url)
+                is_subdomain = (link_parsed.netloc != base_parsed.netloc and 
+                               self.is_same_base_domain(base_url, normalized_url))
+                
+                # Check if link text or URL contains keywords
+                link_text = link.get_text(strip=True).lower()
+                url_lower = normalized_url.lower()
+                link_parsed = urlparse(normalized_url)
+                link_path_parts = [p for p in link_parsed.path.split('/') if p]
+                
+                # Check if this is a "Contact" link (CRITICAL for teacher pages)
+                is_contact_link = (
+                    'contact' in link_text or 
+                    'contact' in url_lower or
+                    link_parsed.path.endswith('/contact')
+                )
+                
+                # Check if this is a teacher name link (URL pattern like /firstname-lastname)
+                # Teacher links typically have hyphenated names in the URL
+                is_teacher_name_link = (
+                    len(link_path_parts) >= 1 and
+                    '-' in link_path_parts[-1] and  # Has hyphen (name pattern)
+                    not any(kw in url_lower for kw in ['websites', 'contact', 'page', 'admin', 'login']) and
+                    link_path_parts[-1].count('-') >= 1 and  # At least one hyphen
+                    len(link_path_parts[-1].split('-')) >= 2  # Has at least 2 parts (firstname-lastname)
+                )
+                
+                # Enhanced keywords for finding teacher emails
+                teacher_keywords = priority_keywords + [
+                    'enseignant', 'enseignants', 'professeur', 'professeurs',
+                    'teacher', 'teachers', 'faculty', 'staff', 'personnel',
+                    'annuaire', 'directory', 'contact', 'equipe', 'team'
+                ]
+                is_priority = any(keyword in link_text or keyword in url_lower 
+                                for keyword in teacher_keywords)
+                
+                # Check if this is a faculty/major/department link
+                is_faculty_link = any(keyword in link_text or keyword in url_lower 
+                                     for keyword in faculty_keywords)
+                
+                # Detect pagination links (especially for /websites pages)
+                # Check for pagination patterns: /websites?page=, ?page=, ?p=, numeric links, next/last links
+                is_pagination = (
+                    ('websites' in url_lower and ('page=' in url_lower or '&page=' in url_lower)) or
+                    ('page=' in url_lower or '&page=' in url_lower or '?page=' in url_lower) or
+                    ('p=' in url_lower or '&p=' in url_lower or '?p=' in url_lower) or
+                    (link_text.isdigit() and link_text != '') or
+                    link_text.lower() in ['next', 'suivant', '»', 'last', 'dernier', 'precedent', 'previous', '«'] or
+                    ('websites' in base_url.lower() and link_text.isdigit())
+                )
+                
+                # Priority order: Contact links (on teacher pages) > Pagination > Teacher name links > Faculty > Subdomains > Priority > Regular
+                # Pagination is CRITICAL - need to get all 55 pages before following teacher links
+                if is_contact_link and is_teacher_page:
+                    # Contact link on teacher page - HIGHEST PRIORITY (leads directly to email)
+                    contact_links.append(normalized_url)
+                elif is_contact_link:
+                    # Contact link anywhere - also high priority
+                    contact_links.append(normalized_url)
+                elif is_pagination:
+                    # Pagination links - VERY HIGH PRIORITY (need all pages to find all teachers)
+                    # Put pagination BEFORE teacher links so we get all pages first
+                    priority_links.insert(0, normalized_url)  # Insert at front for highest priority
+                elif is_teacher_name_link:
+                    # Teacher name link - very high priority (leads to teacher page, then contact)
+                    teacher_links.append(normalized_url)
+                elif is_faculty_link:
+                    faculty_links.append(normalized_url)
+                elif is_subdomain:
+                    subdomain_links.append(normalized_url)
+                elif is_priority:
+                    priority_links.append(normalized_url)
+                else:
+                    regular_links.append(normalized_url)
         
         # Also process URLs found in text content
         for text_url in text_urls:
             try:
                 normalized_text_url = self.normalize_url(text_url)
                 if (normalized_text_url not in seen_urls and 
-                    self.is_same_base_domain(base_url, normalized_text_url) and
-                    normalized_text_url not in self.visited_urls and
-                    self.can_fetch(normalized_text_url)):
+                    self.is_same_base_domain(base_url, normalized_text_url)):
                     seen_urls.add(normalized_text_url)
                     base_parsed = urlparse(base_url)
                     text_parsed = urlparse(normalized_text_url)
@@ -569,11 +861,58 @@ class EmailScraper:
             except Exception:
                 continue
         
-        # Return subdomain links first (highest priority), then priority links, then regular links
-        return subdomain_links + priority_links + regular_links
+        # Return links in priority order:
+        # 1. Contact links (HIGHEST - especially on teacher pages, lead directly to emails)
+        # 2. Pagination links (CRITICAL - need all pages to find all teachers, e.g., 55 pages)
+        # 3. Teacher name links (very high - lead to teacher pages, then contact)
+        # 4. Faculty/major links (high - lead to department pages with teachers)
+        # 5. Subdomain links (important for finding department subdomains)
+        # 6. Priority links (teacher/staff related)
+        # 7. Regular links (everything else)
+        return contact_links + priority_links + teacher_links + faculty_links + subdomain_links + regular_links
+    
+    def _discover_subdomains_from_html(self, html: str, base_url: str) -> List[str]:
+        """Discover subdomain URLs from HTML content (finds department subdomains like fmath.usthb.dz).
+        Only uses actual links, not text mentions, to avoid false positives."""
+        discovered = []
+        try:
+            soup = BeautifulSoup(html, self.html_parser)
+        except Exception:
+            soup = BeautifulSoup(html, 'html.parser')
+        
+        base_parsed = urlparse(base_url)
+        base_domain_no_www = self._strip_www(base_parsed.netloc)
+        
+        # Find all links that point to subdomains (only actual links, not text)
+        # If a subdomain is in an actual link on the website, it likely exists - try it
+        # No hardcoded patterns - only use what's actually linked on the website
+        for link in soup.find_all('a', href=True):
+            href = link['href']
+            full_url = urljoin(base_url, href)
+            parsed_link = urlparse(full_url)
+            
+            if not parsed_link.netloc:
+                continue
+            
+            # Check if it's a subdomain of the base domain
+            link_domain_no_www = self._strip_www(parsed_link.netloc)
+            if (link_domain_no_www != base_domain_no_www and 
+                link_domain_no_www.endswith('.' + base_domain_no_www)):
+                # If it's linked on the website, it's likely valid - add it
+                # DNS errors will filter out non-existent ones quickly (connect=0 retries)
+                normalized = self.normalize_url(full_url)
+                if self.is_same_base_domain(base_url, normalized) and normalized not in discovered:
+                    discovered.append(normalized)
+        
+        # Don't search in text content - too many false positives
+        # Only use actual links found in HTML
+        
+        return discovered
     
     def discover_subdomain_pages(self, base_url: str) -> List[str]:
-        """Try to discover common subdomain pages that might contain staff emails."""
+        """Discover subdomain pages that likely contain teacher emails.
+        Uses smart patterns for common department subdomains (e.g., fmath.usthb.dz for math department).
+        These are tried because they commonly exist and contain teacher directories."""
         parsed = urlparse(base_url)
         base_domain = parsed.netloc
         if not base_domain:
@@ -581,138 +920,335 @@ class EmailScraper:
         
         scheme = parsed.scheme or 'https'
         discovered = set()
-        # IMPORTANT: if seed is like www.usthb.dz, subdomains should be staff.usthb.dz (not staff.www.usthb.dz)
         base_domain_no_www = self._strip_www(base_domain)
         
-        # Common patterns for university staff pages
-        patterns = ['staff', 'personnel', 'enseignants', 'professeurs', 
-                   'faculty', 'annuaire', 'directory', 'contact', 'websites']
+        # Smart department subdomain patterns - only the most common ones that typically have teacher emails
+        # These are based on actual Algerian university patterns
+        # Short codes are more likely to exist than full words
+        common_dept_subdomains = [
+            # Math/Computer Science (very common)
+            'fmath', 'math', 'info', 'informatique',
+            # Sciences
+            'phys', 'chim', 'bio', 'fbiol',
+            # Engineering
+            'elec', 'meca', 'civil', 'archi',
+            # Other departments
+            'eco', 'droit', 'lettres', 'philo', 'socio', 'psy'
+        ]
         
-        # Try subdomain patterns (e.g., staff.univ-batna2.dz)
-        for pattern in patterns:
-            subdomain_url = f"{scheme}://{pattern}.{base_domain_no_www}"
+        # Try these common department subdomains - they're likely to exist and have teacher emails
+        for dept in common_dept_subdomains:
+            subdomain_url = f"{scheme}://{dept}.{base_domain_no_www}"
             normalized = self.normalize_url(subdomain_url)
             if self.is_same_base_domain(base_url, normalized):
                 discovered.add(normalized)
         
-        # Try path patterns (e.g., univ-batna2.dz/websites)
-        for pattern in patterns:
-            # Use both www and non-www for paths, since both exist in the wild
-            for host in {base_domain, base_domain_no_www}:
-                path_url = f"{scheme}://{host}/{pattern}"
-                normalized = self.normalize_url(path_url)
-                if self.is_same_base_domain(base_url, normalized):
-                    discovered.add(normalized)
-        
         return list(discovered)
     
+    def _process_url(self, url: str, seed_url: str) -> Tuple[str, Optional[List[Dict]], Optional[str], List[str]]:
+        """Process a single URL and return emails, HTML, and new links (thread-safe)."""
+        # Skip login/admin pages early (before fetching) - they're not useful and cause Playwright timeouts
+        url_lower = url.lower()
+        if any(skip in url_lower for skip in ['/user?', '/login', '/admin', 'admin_panel', '?login=', '&login=']):
+            logger.debug(f"Skipping login/admin page: {url}")
+            return url, None, None, []
+        
+        # Check if already visited (thread-safe)
+        with self.visited_lock:
+            if url in self.visited_urls:
+                return url, None, None, []
+            # Mark as visited immediately to prevent duplicate processing
+            self.visited_urls.add(url)
+        
+        # Check robots.txt (outside lock to avoid blocking, but robots.txt is cached so it's fast)
+        if not self.can_fetch(url):
+            logger.debug(f"Skipping {url} (disallowed by robots.txt)")
+            return url, None, None, []
+        
+        # Get crawl delay
+        delay = self.get_crawl_delay(url)
+        if delay > 0:
+            time.sleep(delay)
+        
+        # Fetch HTML
+        response = self.fetch_html(url)
+        html = None
+        emails = []
+        
+        if response is None:
+            # If fetch_html failed (403, etc.), try Playwright directly for /websites pages
+            if 'websites' in url_lower and not any(skip in url_lower for skip in ['/user?', '/login', '/admin', 'admin_panel', '?login=', '&login=']):
+                logger.info(f"Regular fetch failed for {url}, trying Playwright")
+                try:
+                    playwright_html = self.fetch_html_with_playwright(url)
+                    if playwright_html:
+                        html = playwright_html
+                        emails = self.extract_emails_from_html(html, url)
+                        logger.info(f"Playwright succeeded for {url}, found {len(emails)} emails")
+                    else:
+                        logger.warning(f"Playwright also failed for {url}")
+                        return url, None, None, []
+                except Exception as e:
+                    logger.warning(f"Playwright failed for {url}: {e}")
+                    return url, None, None, []
+            else:
+                logger.debug(f"Failed to fetch {url} - response is None")
+                return url, None, None, []
+        else:
+            # Ensure proper encoding (handle .dz domain encoding issues)
+            if response.encoding is None:
+                response.encoding = 'utf-8'
+            try:
+                html = response.text
+            except UnicodeDecodeError:
+                # Try to decode with different encodings common in .dz sites
+                for encoding in ['iso-8859-1', 'windows-1256', 'utf-8']:
+                    try:
+                        html = response.content.decode(encoding)
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                else:
+                    logger.warning(f"Could not decode {url}, skipping")
+                    return url, None, None, []
+            
+            # Extract emails from HTML
+            emails = self.extract_emails_from_html(html, url)
+            
+            # For /websites pages, ALWAYS try Playwright - emails might be in JS-rendered content
+            # Also try Playwright if no emails found and page is small
+            # BUT skip Playwright for login/admin pages (they cause timeouts and have no emails)
+            should_try_playwright = (
+                'websites' in url_lower or  # ALL /websites pages - emails might be JS-rendered
+                (len(emails) == 0 and len(html) < 10000)
+            ) and not any(skip in url_lower for skip in ['/user?', '/login', '/admin', 'admin_panel', '?login=', '&login='])
+            
+            if should_try_playwright:
+                try:
+                    logger.debug(f"Trying Playwright for {url} (websites page or no emails found)")
+                    playwright_html = self.fetch_html_with_playwright(url)
+                    if playwright_html:
+                        emails = self.extract_emails_from_html(playwright_html, url)
+                        logger.debug(f"Playwright found {len(emails)} emails on {url}")
+                        # Use Playwright HTML for link discovery too (it has the rendered content)
+                        html = playwright_html
+                except Exception as e:
+                    logger.debug(f"Playwright failed for {url}: {e}")
+        
+        # Find links on page
+        new_links = self.find_links_on_page(html, url)
+        
+        return url, emails, html, new_links
+    
     def scrape_domain(self, seed_url: str) -> List[Dict]:
-        """Scrape a domain starting from seed URL, including subdomains."""
+        """Scrape a domain starting from seed URL, including subdomains (optimized with concurrency)."""
         logger.info(f"Scraping domain: {seed_url}")
         all_emails = []
         
         # Normalize seed URL
         normalized_seed = self.normalize_url(seed_url)
         
-        # Start with seed URL only - we'll add discovered subdomains after crawling main page
+        # Check if seed URL is already a subdomain (like staff.univ-batna2.dz)
+        # If so, skip subdomain discovery - go directly to the page
+        seed_parsed = urlparse(normalized_seed)
+        seed_domain = seed_parsed.netloc
+        seed_domain_no_www = self._strip_www(seed_domain)
+        
+        # Extract base domain (for .dz domains, base is last 2 parts, e.g., univ-batna2.dz)
+        domain_parts = seed_domain_no_www.split('.')
+        if len(domain_parts) >= 2 and domain_parts[-1] == 'dz':
+            base_domain_parts = domain_parts[-2:]  # Last 2 parts (e.g., ['univ-batna2', 'dz'])
+            base_domain = '.'.join(base_domain_parts)
+        else:
+            base_domain = seed_domain_no_www
+        
+        # Check if it's already a subdomain (has more parts than base domain)
+        # For staff.univ-batna2.dz: domain_parts = ['staff', 'univ-batna2', 'dz'] (3 parts)
+        # base_domain = 'univ-batna2.dz' (2 parts) -> is subdomain
+        is_already_subdomain = len(domain_parts) > len(base_domain.split('.'))
+        
+        discovered_subdomains = []
+        
+        # Only try subdomain discovery if NOT already on a subdomain
+        if not is_already_subdomain:
+            # First, try common department subdomains that typically have teacher emails
+            common_subdomains = self.discover_subdomain_pages(normalized_seed)
+            discovered_subdomains.extend(common_subdomains)
+            logger.info(f"Trying {len(common_subdomains)} common department subdomains for teacher emails")
+            
+            # Then, fetch main page to discover additional subdomains from actual links
+            try:
+                main_page_response = self.fetch_html(normalized_seed)
+                if main_page_response:
+                    main_page_html = main_page_response.text
+                    # Find subdomain links in the main page (only actual links)
+                    discovered_from_main = self._discover_subdomains_from_html(main_page_html, normalized_seed)
+                    discovered_subdomains.extend(discovered_from_main)
+                    logger.info(f"Discovered {len(discovered_from_main)} additional subdomains from main page links")
+            except Exception as e:
+                logger.debug(f"Could not fetch main page for subdomain discovery: {e}")
+        else:
+            logger.info(f"Seed URL is already a subdomain ({seed_domain}), skipping subdomain discovery - going directly to page")
+        
+        # Remove duplicates
+        discovered_subdomains = list(set(discovered_subdomains))
+        if discovered_subdomains:
+            logger.info(f"Total {len(discovered_subdomains)} unique subdomains to try")
+        
+        # Initialize queue with seed (and discovered subdomains if any)
+        queue = deque([normalized_seed] + discovered_subdomains)
+        seen_in_queue = {normalized_seed} | set(discovered_subdomains)
+        
         pages_scraped = 0
-        queue = deque([normalized_seed])
-        seen_in_queue = {normalized_seed}  # Track URLs already in queue to avoid duplicates
-        discovered_subdomains = self.discover_subdomain_pages(normalized_seed)
-        discovered_added = False  # Track if we've added discovered subdomains yet
-        
-        # Safety limit: prevent unbounded queue growth if pages keep failing
-        max_queue_size = MAX_PAGES_PER_DOMAIN * 10
+        max_queue_size = MAX_PAGES_PER_DOMAIN * 5  # Increased queue size for large sites (55 pages × teachers × contact pages)
         consecutive_failures = 0
-        max_consecutive_failures = 5
+        max_consecutive_failures = 100  # Very high threshold - don't stop early, keep trying to find links
+        # DNS failures don't count as consecutive failures (they're expected for non-existent subdomains)
         
-        while queue and pages_scraped < MAX_PAGES_PER_DOMAIN:
-            # Safety check: prevent queue from growing too large
-            if len(queue) > max_queue_size:
-                logger.warning(f"Queue size exceeded {max_queue_size}, stopping crawl for {seed_url}")
-                break
-            
-            url = queue.popleft()
-            
-            if url in self.visited_urls:
-                continue
+        # Use ThreadPoolExecutor for concurrent processing
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            while queue and pages_scraped < MAX_PAGES_PER_DOMAIN:
+                # Safety check
+                if len(queue) > max_queue_size:
+                    logger.warning(f"Queue size exceeded {max_queue_size}, stopping crawl for {seed_url}")
+                    break
                 
-            if not self.can_fetch(url):
-                logger.info(f"Skipping {url} (disallowed by robots.txt)")
-                self.visited_urls.add(url)  # Mark as visited to avoid retrying
-                continue
-            
-            self.visited_urls.add(url)
-            delay = self.get_crawl_delay(url)
-            time.sleep(delay)
-            
-            # Fetch HTML once
-            response = self.fetch_html(url)
-            if response is None:
-                consecutive_failures += 1
-                # If too many consecutive failures, stop adding new links
+                # Process batch of URLs concurrently
+                batch_size = min(self.max_workers, len(queue), MAX_PAGES_PER_DOMAIN - pages_scraped)
+                if batch_size == 0:
+                    break
+                
+                batch_urls = [queue.popleft() for _ in range(batch_size)]
+                future_to_url = {executor.submit(self._process_url, url, normalized_seed): url 
+                                for url in batch_urls}
+                
+                batch_emails = []
+                batch_new_links = []
+                
+                for future in as_completed(future_to_url):
+                    url = future_to_url[future]
+                    try:
+                        processed_url, emails, html, new_links = future.result()
+                        
+                        # If we got HTML or emails, it's a successful fetch
+                        if html is not None:
+                            # Successfully fetched page
+                            consecutive_failures = 0
+                            pages_scraped += 1
+                            
+                            if emails:
+                                batch_emails.extend(emails)
+                            
+                            if new_links:
+                                batch_new_links.extend(new_links)
+                        else:
+                            # Failed to fetch (None returned)
+                            # Only increment if we have links in queue (means we're still trying)
+                            # If queue is empty and we failed, that's a real failure
+                            if len(queue) > 0 or len(batch_new_links) > 0:
+                                # We have more links to try, don't count this as a failure yet
+                                consecutive_failures = min(consecutive_failures, 5)  # Cap at 5
+                            else:
+                                consecutive_failures += 1
+                            
+                    except Exception as e:
+                        logger.error(f"Error processing {url}: {e}")
+                        consecutive_failures += 1
+                
+                # Add emails found in this batch
+                all_emails.extend(batch_emails)
+                
+                # Add new links to queue (prioritize pagination, contact, and teacher name links)
+                contact_links = []
+                teacher_links = []
+                faculty_links = []
+                subdomain_links = []
+                priority_links = []
+                regular_links = []
+                
+                # Keywords for faculties/majors/departments
+                faculty_keywords = [
+                    'faculte', 'faculty', 'facultes', 'faculties',
+                    'departement', 'department', 'departements', 'departments',
+                    'filiere', 'specialite', 'formation', 'domaine',
+                    'section', 'option', 'mathematiques', 'informatique',
+                    'physique', 'chimie', 'biologie', 'electronique',
+                    'mecanique', 'genie', 'economie', 'droit',
+                    'lettres', 'philosophie', 'sociologie', 'psychologie',
+                    'medecine', 'pharmacie', 'sciences', 'islamiques', 'fsi'
+                ]
+                
+                for link in batch_new_links:
+                    normalized_link = self.normalize_url(link)
+                    if normalized_link in seen_in_queue:
+                        continue
+                    
+                    with self.visited_lock:
+                        if normalized_link in self.visited_urls:
+                            continue
+                    
+                    # Check if it's a subdomain
+                    base_parsed = urlparse(normalized_seed)
+                    link_parsed = urlparse(normalized_link)
+                    is_subdomain = (link_parsed.netloc != base_parsed.netloc and 
+                                   self.is_same_base_domain(normalized_seed, normalized_link))
+                    
+                    # Check for priority keywords
+                    priority_keywords = ['staff', 'websites', 'contact', 'personnel', 'enseignants',
+                                       'professeurs', 'annuaire', 'directory']
+                    url_lower = normalized_link.lower()
+                    is_priority = any(kw in url_lower for kw in priority_keywords)
+                    
+                    # Check if it's a contact link (HIGHEST PRIORITY - leads directly to email)
+                    is_contact = 'contact' in url_lower or link_parsed.path.endswith('/contact')
+                    
+                    # Check if it's a teacher name link (URL pattern like /firstname-lastname)
+                    link_path_parts = [p for p in link_parsed.path.split('/') if p]
+                    is_teacher_name = (
+                        len(link_path_parts) >= 1 and
+                        '-' in link_path_parts[-1] and
+                        not any(kw in url_lower for kw in ['websites', 'contact', 'page', 'admin', 'login']) and
+                        link_path_parts[-1].count('-') >= 1 and
+                        len(link_path_parts[-1].split('-')) >= 2
+                    )
+                    
+                    # Check if it's a pagination link (CRITICAL - need all pages)
+                    is_pagination = (
+                        ('websites' in url_lower and ('page=' in url_lower or '&page=' in url_lower)) or
+                        ('page=' in url_lower or '&page=' in url_lower or '?page=' in url_lower) or
+                        ('p=' in url_lower or '&p=' in url_lower or '?p=' in url_lower)
+                    )
+                    
+                    # Check if it's a faculty/major/department link
+                    is_faculty = any(kw in url_lower for kw in faculty_keywords)
+                    
+                    if is_contact:
+                        contact_links.append(normalized_link)
+                    elif is_pagination:
+                        # Pagination links - VERY HIGH PRIORITY (need all pages first)
+                        priority_links.insert(0, normalized_link)  # Insert at front
+                    elif is_teacher_name:
+                        teacher_links.append(normalized_link)
+                    elif is_faculty:
+                        faculty_links.append(normalized_link)
+                    elif is_subdomain:
+                        subdomain_links.append(normalized_link)
+                    elif is_priority:
+                        priority_links.append(normalized_link)
+                    else:
+                        regular_links.append(normalized_link)
+                    
+                    seen_in_queue.add(normalized_link)
+                
+                # Add links to queue in priority order (contact > pagination > teacher > faculty > subdomain > priority > regular)
+                # Increased limit to 500 to handle large sites with many pages (55 pages × teachers)
+                for link in (contact_links + priority_links + teacher_links + faculty_links + subdomain_links + regular_links)[:500]:
+                    queue.append(link)
+                
+                # Stop if too many consecutive failures
                 if consecutive_failures >= max_consecutive_failures:
                     logger.warning(f"Too many consecutive failures ({consecutive_failures}), stopping crawl for {seed_url}")
                     break
-                continue
-            
-            # Reset failure counter on success
-            consecutive_failures = 0
-            
-            # Ensure proper encoding (requests handles this, but be explicit)
-            if response.encoding is None:
-                response.encoding = 'utf-8'
-            html = response.text
-            
-            # Extract emails from HTML
-            emails = self.extract_emails_from_html(html, url)
-            
-            # If no emails and page is small, try Playwright for JS-rendered content
-            if len(emails) == 0 and len(html) < 5000:
-                logger.info(f"Trying Playwright for {url} (small page, might be JS-rendered)")
-                playwright_html = self.fetch_html_with_playwright(url)
-                if playwright_html:
-                    emails = self.extract_emails_from_html(playwright_html, url)
-            
-            all_emails.extend(emails)
-            pages_scraped += 1
-            
-            # Find more links to crawl (use the HTML we already fetched)
-            if pages_scraped < MAX_PAGES_PER_DOMAIN:
-                new_links = self.find_links_on_page(html, url)
-                
-                # If this was the seed URL and we found links, prioritize those over discovered subdomains
-                # Otherwise, add discovered subdomains as fallback if we haven't added them yet
-                if url == normalized_seed and len(new_links) > 0:
-                    # Seed URL found links - add them first, then discovered subdomains as fallback
-                    for link in new_links[:30]:  # Limit to 30 links
-                        normalized_link = self.normalize_url(link)
-                        if normalized_link not in seen_in_queue and normalized_link not in self.visited_urls:
-                            queue.append(normalized_link)
-                            seen_in_queue.add(normalized_link)
-                    
-                    # Add discovered subdomains to the END of queue (lower priority) if not already found
-                    if not discovered_added:
-                        for disc_url in discovered_subdomains:
-                            if disc_url not in seen_in_queue and disc_url not in self.visited_urls:
-                                queue.append(disc_url)  # Add to end, not beginning
-                                seen_in_queue.add(disc_url)
-                        discovered_added = True
-                elif url == normalized_seed and len(new_links) == 0:
-                    # Seed URL found no links - add discovered subdomains as fallback
-                    if not discovered_added:
-                        for disc_url in discovered_subdomains:
-                            if disc_url not in seen_in_queue and disc_url not in self.visited_urls:
-                                queue.append(disc_url)
-                                seen_in_queue.add(disc_url)
-                        discovered_added = True
-                else:
-                    # Regular page - just add its links
-                    for link in new_links[:30]:  # Limit to 30 links
-                        normalized_link = self.normalize_url(link)
-                        if normalized_link not in seen_in_queue and normalized_link not in self.visited_urls:
-                            queue.append(normalized_link)
-                            seen_in_queue.add(normalized_link)
         
         logger.info(f"Scraped {pages_scraped} pages from {seed_url}, found {len(all_emails)} email occurrences")
         return all_emails
@@ -752,12 +1288,13 @@ class EmailScraper:
             # Don't raise - continue scraping even if save fails
     
     def clean_and_dedupe_emails(self):
-        """Clean and deduplicate emails from raw CSV."""
+        """Clean and deduplicate emails from raw CSV, removing administrative/institutional emails."""
         if not OUTPUT_RAW.exists():
             logger.warning("No raw emails file found")
             return
         
         emails_dict: Dict[str, Dict] = {}
+        excluded_count = 0
         
         try:
             with open(OUTPUT_RAW, 'r', encoding='utf-8') as f:
@@ -773,6 +1310,11 @@ class EmailScraper:
                     
                     email = row['email'].lower().strip()
                     if not email or '@' not in email:
+                        continue
+                    
+                    # Filter out administrative/institutional emails (keep only teacher emails)
+                    if self.is_institutional_email(email):
+                        excluded_count += 1
                         continue
                     
                     if email not in emails_dict:
@@ -805,14 +1347,16 @@ class EmailScraper:
             logger.error(f"Error reading raw CSV: {e}")
             return
         
-        # Write clean CSV
+        # Write clean CSV (only teacher emails, no administrative)
         with open(OUTPUT_CLEAN, 'w', newline='', encoding='utf-8') as f:
             fieldnames = ['email', 'domain', 'first_seen', 'sources', 'verified', 'status', 'notes']
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(emails_dict.values())
         
-        logger.info(f"Created clean CSV with {len(emails_dict)} unique emails at {OUTPUT_CLEAN}")
+        logger.info(f"Created clean CSV with {len(emails_dict)} unique teacher emails at {OUTPUT_CLEAN}")
+        if excluded_count > 0:
+            logger.info(f"Excluded {excluded_count} administrative/institutional emails")
     
     def run(self):
         """Main run method."""
